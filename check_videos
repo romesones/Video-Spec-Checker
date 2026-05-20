@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""
+check_videos.py — Scan a folder of video files and verify they match a target
+spec (resolution, frame rate, color space, codec, bitrate, audio sample rate,
+bit depth, and peak loudness) using ffprobe / ffmpeg.
+
+Requirements:
+    - Python 3.8+
+    - ffprobe + ffmpeg on PATH (install ffmpeg: https://ffmpeg.org/download.html)
+
+Examples:
+    # Interactive:
+    python check_videos.py
+
+    # One-shot:
+    python check_videos.py --folder ./footage \
+        --width 3840 --height 2160 --fps 23.976 --colorspace bt2020nc \
+        --codec hevc --bitrate 80 --sample-rate 48000 --bit-depth 24 \
+        --max-db -1.0 --recursive --csv results.csv --json results.json
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from fractions import Fraction
+from pathlib import Path
+
+VIDEO_EXTS = {
+    ".mp4", ".mov", ".mkv", ".avi", ".m4v", ".mxf", ".webm",
+    ".mts", ".m2ts", ".ts", ".wmv", ".flv",
+}
+
+FPS_TOLERANCE = 0.02
+BITRATE_TOLERANCE_MBPS = 1.0  # allow ±1 Mbps slack
+
+# Map common ffmpeg sample_fmt values to bit depth.
+SAMPLE_FMT_BITS = {
+    "u8": 8, "u8p": 8,
+    "s16": 16, "s16p": 16,
+    "s32": 32, "s32p": 32,
+    "s64": 64, "s64p": 64,
+    "flt": 32, "fltp": 32,
+    "dbl": 64, "dblp": 64,
+}
+
+
+def run(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def ffprobe_info(path: Path) -> dict:
+    """Return { 'video': {...}, 'audio': {...}, 'format': {...} } or {}."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,"
+        "avg_frame_rate,color_space,color_primaries,color_transfer,pix_fmt,"
+        "bit_rate,sample_rate,sample_fmt,bits_per_raw_sample,bits_per_sample,"
+        "channels:format=duration,bit_rate,format_name",
+        "-of", "json",
+        str(path),
+    ]
+    out = run(cmd, timeout=30)
+    if not out or not out.stdout:
+        return {}
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {}
+    result = {"video": {}, "audio": {}, "format": data.get("format") or {}}
+    for s in data.get("streams") or []:
+        t = s.get("codec_type")
+        if t == "video" and not result["video"]:
+            result["video"] = s
+        elif t == "audio" and not result["audio"]:
+            result["audio"] = s
+    return result
+
+
+def ffmpeg_peak_db(path: Path) -> float | None:
+    """Return peak audio level in dBFS (negative number), or None."""
+    cmd = ["ffmpeg", "-nostats", "-hide_banner", "-i", str(path),
+           "-map", "0:a:0?", "-af", "volumedetect",
+           "-f", "null", "-"]
+    out = run(cmd, timeout=180)
+    if not out:
+        return None
+    m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", out.stderr or "")
+    return float(m.group(1)) if m else None
+
+
+def parse_fps(value: str) -> float | None:
+    if not value or value in ("0/0", "N/A"):
+        return None
+    try:
+        return float(Fraction(value)) if "/" in value else float(value)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def parse_bitrate_mbps(value) -> float | None:
+    try:
+        return round(int(value) / 1_000_000, 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def bit_depth_from_audio(a: dict) -> int | None:
+    for key in ("bits_per_raw_sample", "bits_per_sample"):
+        v = a.get(key)
+        try:
+            iv = int(v)
+            if iv > 0:
+                return iv
+        except (TypeError, ValueError):
+            pass
+    return SAMPLE_FMT_BITS.get((a.get("sample_fmt") or "").lower())
+
+
+def collect_videos(folder: Path, recursive: bool) -> list[Path]:
+    it = folder.rglob("*") if recursive else folder.iterdir()
+    return sorted(p for p in it if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
+
+
+def check_file(path: Path, target: dict, check_db: bool) -> dict:
+    info = ffprobe_info(path)
+    v = info.get("video") or {}
+    a = info.get("audio") or {}
+    fmt = info.get("format") or {}
+
+    if not v and not a:
+        return {"path": str(path), "ok": False,
+                "reasons": ["ffprobe failed / not a media file"], "actual": {}}
+
+    width = v.get("width")
+    height = v.get("height")
+    fps = parse_fps(v.get("avg_frame_rate") or "") or parse_fps(v.get("r_frame_rate") or "")
+    colorspace = (v.get("color_space") or "").lower() or "unknown"
+    codec = (v.get("codec_name") or "").lower() or None
+    # Prefer video stream bitrate; fall back to container bitrate.
+    bitrate_mbps = parse_bitrate_mbps(v.get("bit_rate")) or parse_bitrate_mbps(fmt.get("bit_rate"))
+
+    sample_rate = None
+    try:
+        sample_rate = int(a.get("sample_rate")) if a.get("sample_rate") else None
+    except (TypeError, ValueError):
+        pass
+    bit_depth = bit_depth_from_audio(a)
+    audio_codec = (a.get("codec_name") or "").lower() or None
+
+    peak_db = ffmpeg_peak_db(path) if check_db and a else None
+
+    actual = {
+        "width": width, "height": height,
+        "fps": round(fps, 3) if fps else None,
+        "color_space": colorspace,
+        "codec": codec,
+        "bitrate_mbps": bitrate_mbps,
+        "audio_codec": audio_codec,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+        "peak_db": peak_db,
+        "pix_fmt": v.get("pix_fmt"),
+    }
+
+    reasons = []
+    if target.get("width") and width != target["width"]:
+        reasons.append(f"width {width} != {target['width']}")
+    if target.get("height") and height != target["height"]:
+        reasons.append(f"height {height} != {target['height']}")
+    if target.get("fps") is not None:
+        if fps is None or abs(fps - target["fps"]) > FPS_TOLERANCE:
+            reasons.append(f"fps {actual['fps']} != {target['fps']}")
+    if target.get("colorspace") and colorspace != target["colorspace"].lower():
+        reasons.append(f"color_space '{colorspace}' != '{target['colorspace']}'")
+    if target.get("codec") and codec != target["codec"].lower():
+        reasons.append(f"codec '{codec}' != '{target['codec']}'")
+    if target.get("bitrate_mbps") is not None:
+        if bitrate_mbps is None or abs(bitrate_mbps - target["bitrate_mbps"]) > BITRATE_TOLERANCE_MBPS:
+            reasons.append(f"bitrate {bitrate_mbps} Mbps != {target['bitrate_mbps']} Mbps (±{BITRATE_TOLERANCE_MBPS})")
+    if target.get("sample_rate") and sample_rate != target["sample_rate"]:
+        reasons.append(f"sample_rate {sample_rate} != {target['sample_rate']}")
+    if target.get("bit_depth") and bit_depth != target["bit_depth"]:
+        reasons.append(f"bit_depth {bit_depth} != {target['bit_depth']}")
+    if target.get("max_db") is not None:
+        if peak_db is None:
+            reasons.append("peak dB unavailable (no audio?)")
+        elif peak_db > target["max_db"]:
+            reasons.append(f"peak {peak_db} dB exceeds max {target['max_db']} dB")
+
+    return {"path": str(path), "ok": not reasons, "reasons": reasons, "actual": actual}
+
+
+def prompt(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    return input(f"{label}{suffix}: ").strip() or default
+
+
+def _opt_int(s):    return int(s) if s else None
+def _opt_float(s):  return float(s) if s else None
+def _opt_str(s):    return s or None
+
+
+def interactive_config(args):
+    print("\n=== Video Spec Checker ===\n(Press Enter to skip any check.)\n")
+    if not args.folder:
+        args.folder = prompt("Folder to scan")
+    if args.width is None:       args.width       = _opt_int(prompt("Target width (px)", ""))
+    if args.height is None:      args.height      = _opt_int(prompt("Target height (px)", ""))
+    if args.fps is None:         args.fps         = _opt_float(prompt("Target frame rate (fps)", ""))
+    if args.colorspace is None:  args.colorspace  = _opt_str(prompt("Target color space (e.g. bt709, bt2020nc)", ""))
+    if args.codec is None:       args.codec       = _opt_str(prompt("Target video codec (e.g. h264, hevc, prores)", ""))
+    if args.bitrate is None:     args.bitrate     = _opt_float(prompt("Target video bitrate (Mbps)", ""))
+    if args.sample_rate is None: args.sample_rate = _opt_int(prompt("Target audio sample rate (Hz, e.g. 48000)", ""))
+    if args.bit_depth is None:   args.bit_depth   = _opt_int(prompt("Target audio bit depth (e.g. 16, 24)", ""))
+    if args.max_db is None:      args.max_db      = _opt_float(prompt("Max allowed peak dBFS (e.g. -1.0)", ""))
+    if not args.recursive:
+        args.recursive = prompt("Recurse into subfolders? (y/N)", "n").lower().startswith("y")
+    if not args.csv_out:
+        args.csv_out = _opt_str(prompt("Write CSV to (path, blank to skip)", ""))
+    return args
+
+
+def write_csv(path: str, rows: list[dict]):
+    cols = ["path", "status", "reasons",
+            "width", "height", "fps", "color_space",
+            "codec", "bitrate_mbps", "audio_codec",
+            "sample_rate", "bit_depth", "peak_db", "pix_fmt"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            a = r.get("actual", {})
+            w.writerow({
+                "path": r["path"],
+                "status": "PASS" if r["ok"] else "FAIL",
+                "reasons": "; ".join(r.get("reasons", [])),
+                **{k: a.get(k) for k in cols if k not in ("path", "status", "reasons")},
+            })
+
+
+def main():
+    p = argparse.ArgumentParser(description="Check video files against a target spec.")
+    p.add_argument("--folder", help="Folder containing video files")
+    p.add_argument("-W", "--width", type=int)
+    p.add_argument("-H", "--height", type=int)
+    p.add_argument("-f", "--fps", type=float)
+    p.add_argument("-c", "--colorspace")
+    p.add_argument("--codec", help="Target video codec (h264, hevc, prores, vp9, av1, ...)")
+    p.add_argument("--bitrate", type=float, help="Target video bitrate in Mbps")
+    p.add_argument("--sample-rate", type=int, help="Target audio sample rate in Hz")
+    p.add_argument("--bit-depth", type=int, help="Target audio bit depth")
+    p.add_argument("--max-db", type=float, help="Max allowed peak dBFS (e.g. -1.0)")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--csv", dest="csv_out", help="Write results to CSV file")
+    p.add_argument("--json", dest="json_out", help="Write full results to JSON")
+    p.add_argument("--non-interactive", action="store_true")
+    args = p.parse_args()
+
+    if not shutil.which("ffprobe") or not shutil.which("ffmpeg"):
+        sys.exit("Error: ffmpeg/ffprobe not found on PATH. Install ffmpeg first.")
+
+    if not args.non_interactive and (
+        not args.folder or all(getattr(args, k) is None for k in
+            ("width","height","fps","colorspace","codec","bitrate",
+             "sample_rate","bit_depth","max_db"))
+    ):
+        args = interactive_config(args)
+
+    folder = Path(args.folder).expanduser().resolve() if args.folder else None
+    if not folder or not folder.is_dir():
+        sys.exit(f"Error: folder not found: {folder}")
+
+    target = {
+        "width": args.width, "height": args.height,
+        "fps": args.fps, "colorspace": args.colorspace,
+        "codec": args.codec, "bitrate_mbps": args.bitrate,
+        "sample_rate": args.sample_rate, "bit_depth": args.bit_depth,
+        "max_db": args.max_db,
+    }
+    check_db = args.max_db is not None
+
+    files = collect_videos(folder, args.recursive)
+    if not files:
+        print(f"No video files found in {folder}")
+        return
+
+    print(f"\nScanning {len(files)} file(s) in {folder}")
+    print(f"Target: {target}")
+    if check_db:
+        print("(Decoding audio for dB peak — this can take longer.)")
+    print()
+
+    all_results, passed, failed = [], [], []
+    for i, f in enumerate(files, 1):
+        r = check_file(f, target, check_db)
+        all_results.append(r)
+        (passed if r["ok"] else failed).append(r)
+        print(f"  [{i}/{len(files)}] {'PASS' if r['ok'] else 'FAIL'}  {f.name}")
+
+    print("\n" + "=" * 60)
+    print(f"PASSED ({len(passed)}):")
+    for r in passed:
+        print(f"  ✓ {r['path']}")
+    print(f"\nFAILED ({len(failed)}):")
+    for r in failed:
+        print(f"  ✗ {r['path']}")
+        for reason in r["reasons"]:
+            print(f"      - {reason}")
+    print("=" * 60)
+
+    if args.csv_out:
+        write_csv(args.csv_out, all_results)
+        print(f"\nCSV written to {args.csv_out}")
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(
+            {"folder": str(folder), "target": target,
+             "passed": passed, "failed": failed}, indent=2))
+        print(f"JSON written to {args.json_out}")
+
+
+if __name__ == "__main__":
+    main()
